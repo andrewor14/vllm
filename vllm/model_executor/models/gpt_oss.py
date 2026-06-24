@@ -1021,8 +1021,23 @@ class GptOssModel(nn.Module, EagleModelMixin):
             if is_pp_missing_parameter(name, self):
                 continue
 
+            if name.endswith("_weight_scale_2") or name.endswith("_input_scale"):
+                # Bug 2b: ModelOpt NVFP4 per-tensor scales. The fused experts are
+                # quantized with a single global scale exported as a scalar;
+                # broadcast it across the per-expert parameter. (Must precede the
+                # ".w13_weight"/".w2_weight" substring checks below, since
+                # "w13_weight_scale_2" contains "w13_weight".)
+                param = params_dict[name]
+                if weight.numel() == 1:
+                    param.data.fill_(weight.reshape(-1)[0].to(param.dtype))
+                else:
+                    param.data.copy_(weight.to(param.dtype).reshape(param.shape))
+                loaded_params.add(name)
+                continue
+
             if ".w13_weight" in name:
-                # Handle MLP gate and up projection weights
+                # Handle MLP gate and up projection weights (also the per-block
+                # ".w13_weight_scale", same [E, 2*I, H] layout).
                 # Extract gate and up projection parts
                 if use_ep:
                     narrow_weight = weight[ep_rank_start:ep_rank_end, ...]
@@ -1202,6 +1217,15 @@ class GptOssForCausalLM(
             ".down_proj.weight_scale": ".w2_weight_scale",
             ".down_proj.bias": ".w2_bias",
             ".down_proj.input_scale": ".w2_input_scale",
+            # Bug 2a: map ModelOpt NVFP4 format (underscore naming). NOTE: longer
+            # suffixes must precede shorter ones so e.g. _weight_scale_2 is not
+            # shadowed by _weight_scale.
+            ".gate_up_proj_weight_scale_2": ".w13_weight_scale_2",
+            ".down_proj_weight_scale_2": ".w2_weight_scale_2",
+            ".gate_up_proj_weight_scale": ".w13_weight_scale",
+            ".down_proj_weight_scale": ".w2_weight_scale",
+            ".gate_up_proj_input_scale": ".w13_input_scale",
+            ".down_proj_input_scale": ".w2_input_scale",
         },
     )
 

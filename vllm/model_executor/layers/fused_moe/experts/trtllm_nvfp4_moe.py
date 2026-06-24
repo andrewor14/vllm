@@ -31,6 +31,17 @@ from vllm.utils.flashinfer import has_flashinfer_trtllm_fused_moe
 logger = init_logger(__name__)
 
 
+def _pad_bias_last_dim(bias: torch.Tensor | None, target: int) -> torch.Tensor | None:
+    """Bug 1: zero-pad an expert bias's last dim up to ``target`` (kernel align).
+
+    The fp4 MoE kernel pads gemm output dims (e.g. GPT-OSS hidden 2880 -> 3072);
+    the corresponding bias must be padded to match or the kernel reads OOB.
+    """
+    if bias is None or bias.shape[-1] >= target:
+        return bias
+    return torch.nn.functional.pad(bias, (0, target - bias.shape[-1]))
+
+
 class TrtLlmNvFp4ExpertsBase:
     """
     NvFp4 TRTLLM-Gen MoE kernels. Supports modular and monolithic interface.
@@ -55,6 +66,22 @@ class TrtLlmNvFp4ExpertsBase:
         )
         self.local_num_experts = moe_config.num_local_experts
         self.ep_rank = moe_config.moe_parallel_config.ep_rank
+
+        # Bug 3: per-expert SwiGLU clamp parameters (GPT-OSS clamped SwiGLU). The
+        # flashinfer kernel expects per-local-expert float32 tensors; absent
+        # (non-clamped activations) they stay None.
+        device = torch.accelerator.current_device_index()
+
+        def _per_expert(value: float | None) -> torch.Tensor | None:
+            if value is None:
+                return None
+            return torch.tensor(
+                [value] * self.local_num_experts, dtype=torch.float32, device=device
+            )
+
+        self.gemm1_alpha = _per_expert(self.quant_config.gemm1_alpha)
+        self.gemm1_beta = _per_expert(self.quant_config.gemm1_beta)
+        self.gemm1_clamp_limit = _per_expert(self.quant_config.gemm1_clamp_limit)
 
         assert self.quant_config.g1_alphas is not None
         assert self.quant_config.a2_gscale is not None
@@ -112,7 +139,13 @@ class TrtLlmNvFp4ExpertsBase:
 
     @staticmethod
     def _supports_activation(activation: MoEActivation) -> bool:
-        """Supports only SiLU, RELU^2 non-gated and GELU activation."""
+        """Supports SiLU, RELU^2 non-gated, GELU.
+
+        Bug 4: GPT-OSS clamped SwiGLU (SWIGLUOAI) is intentionally excluded: the
+        TrtllmGen Gemm2 kernel fails for GPT-OSS's expert config (no precompiled
+        variant), so the oracle falls through to the FLASHINFER_CUTLASS backend,
+        which handles it correctly.
+        """
         return activation in [
             MoEActivation.SILU,
             MoEActivation.RELU2_NO_MUL,
@@ -212,13 +245,14 @@ class TrtLlmNvFp4ExpertsModular(TrtLlmNvFp4ExpertsBase, mk.FusedMoEExpertsModula
             ),
             gemm1_weights=w1,
             gemm1_weights_scale=self.quant_config.w1_scale.view(torch.float8_e4m3fn),
-            gemm1_bias=None,
-            gemm1_alpha=None,
-            gemm1_beta=None,
-            gemm1_clamp_limit=None,
+            # Bug 1: expert biases; Bug 3: clamped-SwiGLU params.
+            gemm1_bias=self.w1_bias,
+            gemm1_alpha=self.gemm1_alpha,
+            gemm1_beta=self.gemm1_beta,
+            gemm1_clamp_limit=self.gemm1_clamp_limit,
             gemm2_weights=w2,
             gemm2_weights_scale=self.quant_config.w2_scale.view(torch.float8_e4m3fn),
-            gemm2_bias=None,
+            gemm2_bias=self.w2_bias,
             output1_scale_scalar=self.g1_scale_c,
             output1_scale_gate_scalar=self.quant_config.g1_alphas,
             output2_scale_scalar=self.quant_config.g2_alphas,
@@ -313,10 +347,19 @@ class TrtLlmNvFp4ExpertsMonolithic(
         if e_score_correction_bias is not None:
             e_score_correction_bias = e_score_correction_bias.to(torch.bfloat16)
 
+        # Bug 1: the hidden dim is zero-padded up to the kernel's alignment (e.g.
+        # GPT-OSS 2880 -> 3072), so gemm2's output bias must be padded to match
+        # or the kernel reads it out of bounds. gemm1 output (2*intermediate) is
+        # padded analogously. Pad with zeros (padded region is truncated later).
+        w1_bias = _pad_bias_last_dim(
+            self.w1_bias, 2 * self.intermediate_size_per_partition
+        )
+        w2_bias = _pad_bias_last_dim(self.w2_bias, self.hidden_dim)
+
         # Invoke kernel.
         # NOTE: Activation padding and output
         # truncation are handled by the MoE runner's
-        return flashinfer.fused_moe.trtllm_fp4_block_scale_moe(
+        _out = flashinfer.fused_moe.trtllm_fp4_block_scale_moe(
             routing_logits=router_logits,
             routing_bias=e_score_correction_bias,
             hidden_states=hidden_states,
@@ -325,13 +368,14 @@ class TrtLlmNvFp4ExpertsMonolithic(
             ),
             gemm1_weights=w1,
             gemm1_weights_scale=self.quant_config.w1_scale.view(torch.float8_e4m3fn),
-            gemm1_bias=None,
-            gemm1_alpha=None,
-            gemm1_beta=None,
-            gemm1_clamp_limit=None,
+            # Bug 1: expert biases; Bug 3: clamped-SwiGLU params.
+            gemm1_bias=w1_bias,
+            gemm1_alpha=self.gemm1_alpha,
+            gemm1_beta=self.gemm1_beta,
+            gemm1_clamp_limit=self.gemm1_clamp_limit,
             gemm2_weights=w2,
             gemm2_weights_scale=self.quant_config.w2_scale.view(torch.float8_e4m3fn),
-            gemm2_bias=None,
+            gemm2_bias=w2_bias,
             output1_scale_scalar=self.g1_scale_c,
             output1_scale_gate_scalar=self.quant_config.g1_alphas,
             output2_scale_scalar=self.quant_config.g2_alphas,
@@ -347,3 +391,4 @@ class TrtLlmNvFp4ExpertsMonolithic(
             do_finalize=True,
             activation_type=activation_to_flashinfer_int(activation),
         )[0]
+        return _out

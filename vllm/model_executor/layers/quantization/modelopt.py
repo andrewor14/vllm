@@ -1535,6 +1535,29 @@ class ModelOptNvFp4FusedMoE(FusedMoEMethodBase):
         )
         layer.register_parameter("w2_input_scale", w2_input_scale)
 
+        # Bug 1: register expert biases (e.g. GPT-OSS). The bias is not quantized
+        # — it is kept in bf16 and applied by the kernel after each grouped GEMM.
+        # Only registered when the MoE layer declares biases, so bias-free models
+        # (Llama4, etc.) are unaffected.
+        if self.moe.has_bias:
+            w13_bias = torch.nn.Parameter(
+                torch.zeros(
+                    num_experts,
+                    w13_num_shards * intermediate_size_per_partition,
+                    dtype=torch.bfloat16,
+                ),
+                requires_grad=False,
+            )
+            layer.register_parameter("w13_bias", w13_bias)
+            set_weight_attrs(w13_bias, extra_weight_attrs)
+
+            w2_bias = torch.nn.Parameter(
+                torch.zeros(num_experts, hidden_size, dtype=torch.bfloat16),
+                requires_grad=False,
+            )
+            layer.register_parameter("w2_bias", w2_bias)
+            set_weight_attrs(w2_bias, extra_weight_attrs)
+
     def process_weights_after_loading(self, layer: FusedMoE) -> None:
         """
         Convert NVFP4 MoE weights into kernel format and setup the kernel.
@@ -1595,6 +1618,15 @@ class ModelOptNvFp4FusedMoE(FusedMoEMethodBase):
         self.moe_kernel.fused_experts.process_weights_after_loading(layer)
 
     def get_fused_moe_quant_config(self, layer: torch.nn.Module) -> FusedMoEQuantConfig:
+        # Bug 3: GPT-OSS clamped SwiGLU constants. Only applied when the layer
+        # uses the swigluoai activation; other models leave these None (standard
+        # SwiGLU).
+        gemm1_alpha = gemm1_beta = gemm1_clamp_limit = None
+        if self.moe.activation == MoEActivation.SWIGLUOAI:
+            gemm1_alpha = 1.702
+            gemm1_beta = 1.0
+            gemm1_clamp_limit = 7.0
+
         return make_nvfp4_moe_quant_config(
             backend=self.nvfp4_backend,
             w13_scale=layer.w13_weight_scale,
@@ -1603,6 +1635,13 @@ class ModelOptNvFp4FusedMoE(FusedMoEMethodBase):
             w2_scale_2=layer.w2_weight_scale_2,
             a13_scale=layer.w13_input_scale,
             a2_scale=layer.w2_input_scale,
+            # Bug 1: per-expert biases.
+            w13_bias=getattr(layer, "w13_bias", None),
+            w2_bias=getattr(layer, "w2_bias", None),
+            # Bug 3: clamped-SwiGLU (swigluoai) params.
+            gemm1_alpha=gemm1_alpha,
+            gemm1_beta=gemm1_beta,
+            gemm1_clamp_limit=gemm1_clamp_limit,
         )
 
     @property

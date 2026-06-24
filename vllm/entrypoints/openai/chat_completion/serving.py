@@ -158,9 +158,19 @@ class OpenAIServingChat(OpenAIServing):
         if self.use_harmony:
             if "stop_token_ids" not in self.default_sampling_params:
                 self.default_sampling_params["stop_token_ids"] = []
-            self.default_sampling_params["stop_token_ids"].extend(
-                get_stop_tokens_for_assistant_actions()
-            )
+            # get_stop_tokens_for_assistant_actions() fetches the harmony vocab
+            # remotely, which fails in offline environments (e.g. verl RL
+            # rollouts). Its stop tokens (<|return|>, <|call|>) are already in
+            # gpt-oss's eos_token_id, so warn and continue instead of crashing.
+            try:
+                self.default_sampling_params["stop_token_ids"].extend(
+                    get_stop_tokens_for_assistant_actions()
+                )
+            except Exception:
+                logger.warning(
+                    "Failed to load harmony encoding for stop tokens. "
+                    "Continuing without assistant action stop tokens."
+                )
 
         self.tool_call_id_type = get_tool_call_id_type(self.model_config)
 

@@ -98,9 +98,13 @@ class FlashInferExperts(mk.FusedMoEExpertsModular):
             get_current_vllm_config().compilation_config.max_cudagraph_capture_size
         )
 
-        if quant_config.weight_quant_dtype == "mxfp4":
-            # This value is used specifically for gpt-oss,
-            # Need to revisit this for other models
+        # Bug 3a: GPT-OSS clamped SwiGLU constants, set for any swigluoai
+        # activation (both mxfp4 and nvfp4) — previously they were only set in the
+        # mxfp4 branch. Other models leave these None.
+        self.gemm1_alpha = None
+        self.gemm1_beta = None
+        self.gemm1_clamp_limit = None
+        if moe_config.activation == MoEActivation.SWIGLUOAI:
             self.gemm1_alpha = torch.tensor(
                 [1.702] * self.num_experts, dtype=torch.float32, device=self.device
             )
@@ -110,6 +114,7 @@ class FlashInferExperts(mk.FusedMoEExpertsModular):
             self.gemm1_clamp_limit = torch.tensor(
                 [7.0] * self.num_experts, dtype=torch.float32, device=self.device
             )
+        if quant_config.weight_quant_dtype == "mxfp4":
             if quant_config.quant_dtype == "mxfp8":
                 self.fake_input_scale = torch.ones(
                     self.num_experts,
@@ -314,6 +319,19 @@ class FlashInferExperts(mk.FusedMoEExpertsModular):
             # FlashInfer API requires weight to be long for nvfp4
             fc1_expert_weights = w1.view(torch.long)
             fc2_expert_weights = w2.view(torch.long)
+            # Bug 3b: GPT-OSS (nvfp4) needs expert biases + clamped-SwiGLU params.
+            if activation == MoEActivation.SWIGLUOAI:
+                # Bug 3c: match the gate/up weight reorder applied in
+                # prepare_nvfp4_moe_layer_for_fi_or_cutlass: GPT-OSS bias is
+                # interleaved [g0,u0,...]; reorder to [up, gate] (odd then even).
+                _b = self.w1_bias
+                if _b is not None:
+                    _b = torch.cat([_b[..., 1::2], _b[..., 0::2]], dim=-1).contiguous()
+                fc1_expert_biases = _b
+                fc2_expert_biases = self.w2_bias
+                swiglu_alpha = self.gemm1_alpha
+                swiglu_beta = self.gemm1_beta
+                swiglu_limit = self.gemm1_clamp_limit
         elif self.weight_quant_dtype == "mxfp4":
             assert self.w1_scale is not None and self.w2_scale is not None
             assert w1.is_contiguous() and w2.is_contiguous()

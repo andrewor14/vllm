@@ -37,6 +37,9 @@ def activation_to_flashinfer_type(activation: MoEActivation) -> "ActivationType"
         MoEActivation.SILU: ActivationType.Swiglu,
         MoEActivation.GELU: ActivationType.Geglu,
         MoEActivation.RELU2_NO_MUL: ActivationType.Relu2,
+        # Bug 3: GPT-OSS clamped SwiGLU is standard Swiglu plus the gemm1
+        # alpha/beta/clamp_limit parameters supplied to the kernel.
+        MoEActivation.SWIGLUOAI: ActivationType.Swiglu,
     }
     return ACTIVATION_TO_FI_ACTIVATION[activation]
 

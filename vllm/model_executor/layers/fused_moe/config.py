@@ -800,6 +800,10 @@ def nvfp4_moe_quant_config(
     w2_scale: torch.Tensor,
     w1_bias: torch.Tensor | None = None,
     w2_bias: torch.Tensor | None = None,
+    # Bug 3: clamped-SwiGLU (swigluoai) params.
+    gemm1_alpha: float | None = None,
+    gemm1_beta: float | None = None,
+    gemm1_clamp_limit: float | None = None,
     is_scale_swizzled: bool = True,
 ) -> FusedMoEQuantConfig:
     """
@@ -811,6 +815,10 @@ def nvfp4_moe_quant_config(
         w2_scale=w2_scale,
         w1_bias=w1_bias,
         w2_bias=w2_bias,
+        # Bug 3: clamped-SwiGLU (swigluoai) params.
+        gemm1_alpha=gemm1_alpha,
+        gemm1_beta=gemm1_beta,
+        gemm1_clamp_limit=gemm1_clamp_limit,
         a1_gscale=a1_gscale,
         a2_gscale=a2_gscale,
         g1_alphas=g1_alphas,
